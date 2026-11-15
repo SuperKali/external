@@ -4,6 +4,7 @@
 //! /root/.not_logged_in_yet and runs armbian-firstlogin, which applies them unattended.
 //! Network is optional: without it, the values start from the image defaults.
 
+mod backdrop;
 mod data;
 mod wifi;
 
@@ -308,6 +309,19 @@ fn setup_progress(line: &str, current: f32) -> f32 {
     step.max(current).max((current + 0.02).min(0.9))
 }
 
+/// The step to show for a line of armbian-firstlogin, when the line starts one.
+fn setup_step(line: &str) -> Option<&'static str> {
+    const STEPS: [(&str, &str); 6] = [
+        ("Waiting for system to finish booting", "Waiting for the system…"),
+        ("Waiting for network startup", "Waiting for the network…"),
+        ("Shell:", "Creating the user account…"),
+        ("has been created", "Setting the time zone…"),
+        ("Generating locales", "Setting the language…"),
+        ("Now starting desktop", "Starting the desktop…"),
+    ];
+    STEPS.iter().rev().find(|(s, _)| line.contains(s)).map(|(_, label)| *label)
+}
+
 /// Run armbian-firstlogin. Its last lines go to the log on the page.
 fn run_firstlogin(ui: &AppWindow, firstlogin: &str) {
     let weak = ui.as_weak();
@@ -347,6 +361,9 @@ fn run_firstlogin(ui: &AppWindow, firstlogin: &str) {
                     continue;
                 }
                 progress = setup_progress(&line, progress);
+                if let Some(step) = setup_step(&line) {
+                    let _ = weak.upgrade_in_event_loop(move |ui| ui.set_step(step.into()));
+                }
                 lines.push(line);
                 // The log shows only after a failure.
                 let text = lines[lines.len().saturating_sub(12)..].join("\n");
@@ -520,6 +537,24 @@ fn handle(ui: &AppWindow, st: &Rc<RefCell<State>>, msg: Msg, refresh: &dyn Fn(bo
     }
 }
 
+/// Make the background for the size of the window and the accent. `last` holds the values
+/// of the image that shows now: the work is done only after a change.
+fn update_backdrop(ui: &AppWindow, last: &mut (u32, u32, slint::Color)) {
+    let size = ui.window().size();
+    let accent = ui.global::<Theme>().get_accent();
+    let now = (size.width, size.height, accent);
+    if ui.get_has_background() || size.width == 0 || size.height == 0 || *last == now {
+        return;
+    }
+    *last = now;
+    // Very large screens: half the size, and Slint makes the image larger.
+    let k = if size.width > 2048 { 2 } else { 1 };
+    let (w, h) = (size.width / k, size.height / k);
+    let rgb = backdrop::render(w, h, [accent.red(), accent.green(), accent.blue()]);
+    let buffer = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(&rgb, w, h);
+    ui.set_backdrop(slint::Image::from_rgb8(buffer));
+}
+
 /// Name (eDP-1) and modes of the first connected display, in the order of the kernel.
 /// The first mode is the preferred one.
 fn screen_modes() -> (String, Vec<(u32, u32)>) {
@@ -607,6 +642,7 @@ fn main() {
     ui.set_dry_run(a.dry_run);
     ui.set_has_zsh(has_zsh());
     ui.set_ip_address(ip_addresses().into());
+    ui.set_hostname(fs::read_to_string("/etc/hostname").unwrap_or_default().trim().into());
     if !font.starts_with('/') {
         ui.set_font_family(font.into());
     }
@@ -936,8 +972,11 @@ fn main() {
     {
         let (weak, st2, r2) = (ui.as_weak(), st.clone(), refresh.clone());
         let mut ticks = 0u32;
+        let mut backdrop = (0, 0, slint::Color::default());
         timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(200), move || {
             let ui = weak.unwrap();
+            // The window has its size only after the start. A new size makes a new image.
+            update_backdrop(&ui, &mut backdrop);
             while let Ok(msg) = rx.try_recv() {
                 handle(&ui, &st2, msg, &*r2);
             }
@@ -1005,6 +1044,12 @@ mod tests {
         assert!(near(setup_progress("some line", 0.9), 0.9));
         assert!(near(setup_progress("Now starting desktop environment via sddm...", 0.6), 0.95));
         assert!(near(setup_progress("some line", 0.95), 0.95));
+    }
+
+    #[test]
+    fn step() {
+        assert_eq!(setup_step("Generating locales: it_IT.UTF-8"), Some("Setting the language…"));
+        assert_eq!(setup_step("some line"), None);
     }
 
     #[test]
