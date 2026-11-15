@@ -26,8 +26,6 @@ export global Theme {
     out property <color> dim: #a1a1aa;
     out property <color> faint: #82828f;
     out property <color> error: #e36d6e;
-    out property <color> success: #10b981;
-    out property <color> success-soft: success.mix(card, 0.16);
     out property <color> warning: #f59e0b;
 }
 
@@ -327,32 +325,6 @@ component Bar inherits Rectangle {
         animate width {
             duration: 400ms;
             easing: ease-out;
-        }
-    }
-}
-
-// The three steps of the setup as lines with their names. The current line shows the progress.
-component Phases inherits HorizontalLayout {
-    in property <int> current;
-    in property <float> progress;
-    in property <bool> indeterminate;
-    in property <bool> large;
-    in property <length> px: 1px;
-    spacing: (root.large ? 14 : 10) * root.px;
-    for label[i] in ["Network", "Account", "Setup"]: VerticalLayout {
-        spacing: (root.large ? 14 : 10) * root.px;
-        Bar {
-            px: root.px;
-            height: (root.large ? 6 : 4) * root.px;
-            progress: i < root.current ? 1 : i == root.current ? root.progress : 0;
-            indeterminate: i == root.current && root.indeterminate;
-        }
-
-        Text {
-            text: label;
-            color: i <= root.current ? Theme.text : Theme.faint;
-            font-size: (root.large ? 16 : 14) * root.px;
-            font-weight: 600;
         }
     }
 }
@@ -730,13 +702,9 @@ export component AppWindow inherits Window {
     in-out property <string> shell: "bash";
     // IPv4 addresses, for SSH. Empty without a network.
     in property <string> ip-address;
-    // Name of the system, for the last page.
-    in property <string> hostname;
 
     in property <string> error;
     in property <string> log;
-    // The step that armbian-firstlogin does now.
-    in property <string> step;
     // Setup progress, 0 to 1.
     in property <float> progress;
     in property <bool> busy;
@@ -763,7 +731,7 @@ export component AppWindow inherits Window {
     callback key-down(string);
     callback key-up(string);
 
-    property <[string]> titles: ["Welcome", "Connect to a wireless network", "Create your account", "Region and keyboard", "Setting up"];
+    property <[string]> titles: ["Welcome", "Connect to a wireless network", "Create your account", "Region and keyboard", "Applying settings"];
 
     // Layout. Large screens: all sizes grow, to 2 times at most.
     property <float> scale: max(1, min(2, min(self.width / 1280px, self.height / 800px)));
@@ -773,7 +741,6 @@ export component AppWindow inherits Window {
     property <bool> dense: self.height < 560px;
     // Pages without input have no side part: the text is in the middle.
     property <bool> stage: self.page == 0 || self.page == 4;
-    property <bool> done: self.page == 4 && self.finished && !self.dry-run;
     property <bool> with-log: self.page == 4 && (self.failed || self.dry-run);
     property <bool> rail: !self.compact && !self.stage;
     property <length> edge: self.compact ? 12px : 32 * self.px;
@@ -785,15 +752,15 @@ export component AppWindow inherits Window {
     property <length> box-h: min(self.free-h, self.compact ? 560px : 600 * self.px);
     property <length> radius: self.compact ? 18px : 24 * self.px;
     property <length> rail-w: self.rail ? max(260px, min(340 * self.px, self.box-w * 0.34)) : 0px;
-    // Width of the text on the pages without input: the wait pages, and the last page.
+    // Width of the text, and of the line, on the pages without input.
     property <length> wait-w: min(self.box-w - 2 * self.pad, 640 * self.px);
-    property <length> column-w: 520 * self.px;
+    property <length> line-w: min(self.wait-w, 400 * self.px);
     // The box has its full height: the account page uses more space between its parts.
     property <bool> roomy: !self.dense && self.box-h >= 590 * self.px;
     // 0 network, 1 account, 2 setup.
     property <int> phase: self.page <= 1 ? 0 : self.page <= 3 ? 1 : 2;
-    property <string> apply-title: self.busy ? self.titles[4] : self.failed ? "Setup failed" : self.dry-run ? "Dry run complete" : self.finished ? "Setup is complete" : self.titles[4];
-    property <string> apply-status: self.busy ? (self.step != "" ? self.step : "Applying the settings…") : self.failed ? "The text setup asks the same questions on this screen." : self.dry-run ? "Press Enter to close." : "";
+    property <string> apply-title: self.failed ? "Setup failed" : self.dry-run ? "Dry run complete" : self.titles[4];
+    property <string> apply-status: self.failed ? "The text setup asks the same questions on this screen." : self.dry-run ? "Press Enter to close." : "";
     // Which region list shows: 0 time zone, 1 language, 2 keyboard.
     property <int> region-tab: 0;
 
@@ -1030,11 +997,14 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        Phases {
-                            px: root.px;
-                            large: true;
-                            current: 0;
-                            indeterminate: true;
+                        HorizontalLayout {
+                            alignment: center;
+                            Bar {
+                                width: root.line-w;
+                                px: root.px;
+                                height: 6 * root.px;
+                                indeterminate: true;
+                            }
                         }
                     }
                 }
@@ -1570,12 +1540,13 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // 4: apply. A real setup closes by itself. Enter closes a dry run.
+                // 4: apply. A title and one progress line. A real setup closes by itself.
+                // The log shows after a failure, and for a dry run. Enter closes a dry run.
                 if root.page == 4: done := FocusScope {
                     vertical-stretch: 1;
                     // The log uses the full width. Other text stays in the middle.
-                    property <bool> wait: !root.with-log && !root.done;
-                    property <length> text-w: root.with-log ? self.width : self.wait ? root.wait-w : min(self.width, root.column-w);
+                    property <bool> wait: !root.with-log;
+                    property <length> text-w: root.with-log ? self.width : root.wait-w;
                     key-pressed(event) => {
                         if event.text == Key.Return && root.finished {
                             root.finish();
@@ -1596,7 +1567,7 @@ export component AppWindow inherits Window {
                         x: (parent.width - done.text-w) / 2;
                         width: done.text-w;
                         height: parent.height;
-                        spacing: (root.with-log ? (root.dense ? 16 : 24) : done.wait ? (root.dense ? 36 : 52) : (root.dense ? 26 : 32)) * root.px;
+                        spacing: (root.with-log ? (root.dense ? 16 : 24) : (root.dense ? 36 : 52)) * root.px;
                         alignment: root.with-log ? stretch : center;
                         HorizontalLayout {
                             alignment: center;
@@ -1608,27 +1579,12 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // The end: a mark, and the facts that the user needs next.
-                        if root.done: HorizontalLayout {
-                            alignment: center;
-                            Rectangle {
-                                width: 60 * root.px;
-                                height: 60 * root.px;
-                                border-radius: 30 * root.px;
-                                background: Theme.success-soft;
-                                Icon {
-                                    source: @image-url("icons/check.svg");
-                                    colorize: Theme.success;
-                                    size: 30 * root.px;
-                                }
-                            }
-                        }
                         VerticalLayout {
                             spacing: (done.wait ? 14 : 12) * root.px;
                             Text {
                                 text: root.apply-title;
                                 color: Theme.text;
-                                font-size: (root.with-log ? 30 : !done.wait ? 40 : root.dense ? 44 : 56) * root.px;
+                                font-size: (root.with-log ? 30 : root.dense ? 44 : 56) * root.px;
                                 font-weight: 700;
                                 letter-spacing: (done.wait ? -1.2 : -0.8) * root.px;
                                 horizontal-alignment: center;
@@ -1637,43 +1593,9 @@ export component AppWindow inherits Window {
                             if root.apply-status != "": Text {
                                 text: root.apply-status;
                                 color: Theme.dim;
-                                font-size: (!done.wait ? 17 : root.dense ? 18 : 20) * root.px;
+                                font-size: 17 * root.px;
                                 horizontal-alignment: center;
                                 wrap: word-wrap;
-                            }
-                        }
-
-                        if root.done: VerticalLayout {
-                            for fact in [
-                                { label: "User", value: root.username },
-                                { label: "System name", value: root.hostname },
-                                { label: "IP address", value: root.ip-address },
-                            ]: VerticalLayout {
-                                if fact.value != "": Rectangle {
-                                    height: 1px;
-                                    background: Theme.border;
-                                }
-                                if fact.value != "": HorizontalLayout {
-                                    height: (root.dense ? 40 : 48) * root.px;
-                                    spacing: 16 * root.px;
-                                    Text {
-                                        text: fact.label;
-                                        color: Theme.dim;
-                                        font-size: 16 * root.px;
-                                        vertical-alignment: center;
-                                    }
-
-                                    Text {
-                                        horizontal-stretch: 1;
-                                        text: fact.value;
-                                        color: Theme.text;
-                                        font-size: 16 * root.px;
-                                        font-weight: 600;
-                                        horizontal-alignment: right;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                    }
-                                }
                             }
                         }
 
@@ -1697,11 +1619,14 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        if done.wait: Phases {
-                            px: root.px;
-                            large: true;
-                            current: 2;
-                            progress: root.progress;
+                        if done.wait: HorizontalLayout {
+                            alignment: center;
+                            Bar {
+                                width: root.line-w;
+                                px: root.px;
+                                height: 6 * root.px;
+                                progress: root.progress;
+                            }
                         }
                     }
                 }

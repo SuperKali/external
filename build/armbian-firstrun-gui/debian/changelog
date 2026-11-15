@@ -1,3 +1,11 @@
+armbian-firstrun-gui (0.1.3) unstable; urgency=medium
+
+  * The account page shows directly after the Wi-Fi page.
+  * The setup page shows "Applying settings" and a progress line. Then the
+    wizard closes. The page with the result is removed.
+
+ -- Armbian <info@armbian.com>  Sun, 15 Nov 2026 14:00:00 +0100
+
 armbian-firstrun-gui (0.1.2) unstable; urgency=medium
 
   * New look: one panel with own controls, a light background from the accent

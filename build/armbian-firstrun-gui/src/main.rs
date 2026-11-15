@@ -30,6 +30,9 @@ const DRY_RUN_OUT: &str = "/run/armbian-firstrun-gui.preset";
 /// Answers kept over the restart that loads a new keyboard layout.
 const RESUME: &str = "/run/armbian-firstrun-gui.resume";
 
+/// The page "Applying settings" shows for this time at least: it must not flash.
+const APPLY_MIN: std::time::Duration = std::time::Duration::from_millis(1500);
+
 const PAGE_CHECK: i32 = 0;
 const PAGE_WIFI: i32 = 1;
 const PAGE_ACCOUNT: i32 = 2;
@@ -161,8 +164,6 @@ struct State {
     checking: bool,
     /// Number of the newest network check: the results of older checks are ignored.
     check_id: u64,
-    /// Connected to Wi-Fi: no internet does not show the Wi-Fi page again.
-    wifi_done: bool,
     dry_run: bool,
     /// Values before the region page opened: Cancel restores them.
     saved: Option<([String; 3], [bool; 3])>,
@@ -309,24 +310,12 @@ fn setup_progress(line: &str, current: f32) -> f32 {
     step.max(current).max((current + 0.02).min(0.9))
 }
 
-/// The step to show for a line of armbian-firstlogin, when the line starts one.
-fn setup_step(line: &str) -> Option<&'static str> {
-    const STEPS: [(&str, &str); 6] = [
-        ("Waiting for system to finish booting", "Waiting for the system…"),
-        ("Waiting for network startup", "Waiting for the network…"),
-        ("Shell:", "Creating the user account…"),
-        ("has been created", "Setting the time zone…"),
-        ("Generating locales", "Setting the language…"),
-        ("Now starting desktop", "Starting the desktop…"),
-    ];
-    STEPS.iter().rev().find(|(s, _)| line.contains(s)).map(|(_, label)| *label)
-}
-
 /// Run armbian-firstlogin. Its last lines go to the log on the page.
 fn run_firstlogin(ui: &AppWindow, firstlogin: &str) {
     let weak = ui.as_weak();
     let firstlogin = firstlogin.to_string();
     std::thread::spawn(move || {
+        let start = std::time::Instant::now();
         // armbian-firstlogin needs a terminal (tty -s): run it in one with script(1).
         // One stream keeps the order of the lines.
         let child = Command::new("script")
@@ -361,9 +350,6 @@ fn run_firstlogin(ui: &AppWindow, firstlogin: &str) {
                     continue;
                 }
                 progress = setup_progress(&line, progress);
-                if let Some(step) = setup_step(&line) {
-                    let _ = weak.upgrade_in_event_loop(move |ui| ui.set_step(step.into()));
-                }
                 lines.push(line);
                 // The log shows only after a failure.
                 let text = lines[lines.len().saturating_sub(12)..].join("\n");
@@ -374,19 +360,18 @@ fn run_firstlogin(ui: &AppWindow, firstlogin: &str) {
             }
         }
         let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-        let _ = weak.upgrade_in_event_loop(move |ui| {
-            if ok {
-                ui.set_progress(1.0);
-            }
-            ui.set_busy(false);
-            ui.set_failed(!ok);
-            ui.set_finished(ok);
-        });
-        // Success: give the screen to tty1 or to the display manager.
         if ok {
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            // Success: the line goes to its end, then the wizard gives the screen to tty1
+            // or to the display manager. A very fast setup stays in view for a moment.
+            let _ = weak.upgrade_in_event_loop(|ui| ui.set_progress(1.0));
+            let end = std::time::Duration::from_millis(600);
+            std::thread::sleep(end.max(APPLY_MIN.saturating_sub(start.elapsed())));
             std::process::exit(0);
         }
+        let _ = weak.upgrade_in_event_loop(|ui| {
+            ui.set_busy(false);
+            ui.set_failed(true);
+        });
     });
 }
 
@@ -457,7 +442,8 @@ fn start_scan(ui: &AppWindow, st: &State) {
 }
 
 /// Use the location for the values that the user did not change.
-fn apply_location(st: &mut State, loc: &Location) {
+/// `keyboard`: false keeps the keyboard, when the user types with it already.
+fn apply_location(st: &mut State, loc: &Location, keyboard: bool) {
     if !st.touched[0] {
         data::add_timezone(&mut st.tz.all, &loc.timezone);
         if st.tz.all.iter().any(|i| i.value == loc.timezone) {
@@ -470,26 +456,50 @@ fn apply_location(st: &mut State, loc: &Location) {
             st.locale.value = l;
         }
     }
-    if !st.touched[2] {
+    if keyboard && !st.touched[2] {
         if let Some(k) = data::keyboard_for(&st.kb.all, &loc.country_code) {
             st.kb.value = k;
         }
     }
 }
 
+/// The location answers when the account page shows already. Empty fields: all three
+/// values change, and a new keyboard layout restarts the wizard as usual. After the first
+/// typed character: the keyboard stays, because the user types the password with it.
+fn late_location(ui: &AppWindow, st: &Rc<RefCell<State>>, loc: &Location, refresh: &dyn Fn(bool)) {
+    let empty = ui.get_realname().is_empty() && ui.get_username().is_empty() && ui.get_password().is_empty() && ui.get_password2().is_empty();
+    apply_location(&mut st.borrow_mut(), loc, empty);
+    refresh(true);
+    if empty {
+        goto_account(ui, &st.borrow());
+    }
+}
+
 fn handle(ui: &AppWindow, st: &Rc<RefCell<State>>, msg: Msg, refresh: &dyn Fn(bool)) {
     match msg {
         Msg::Checked { id, online, loc, quiet } => {
-            // An older check, or the user is on another page now.
-            if id != st.borrow().check_id || ![PAGE_CHECK, PAGE_WIFI].contains(&ui.get_page()) {
+            // An older check.
+            if id != st.borrow().check_id {
                 return;
             }
             st.borrow_mut().checking = false;
+            let page = ui.get_page();
+            if page == PAGE_ACCOUNT {
+                // The account page shows already (after Wi-Fi): the location comes late.
+                if let Some(loc) = loc {
+                    late_location(ui, st, &loc, refresh);
+                }
+                return;
+            }
+            // The user is on another page now.
+            if ![PAGE_CHECK, PAGE_WIFI].contains(&page) {
+                return;
+            }
             if let Some(loc) = loc {
-                apply_location(&mut st.borrow_mut(), &loc);
+                apply_location(&mut st.borrow_mut(), &loc, true);
                 refresh(true);
             }
-            if online || st.borrow().wifi_done {
+            if online {
                 // Without a location: the image defaults.
                 goto_account(ui, &st.borrow());
             } else if quiet {
@@ -524,9 +534,10 @@ fn handle(ui: &AppWindow, st: &Rc<RefCell<State>>, msg: Msg, refresh: &dyn Fn(bo
                 goto_account(ui, &st.borrow());
                 return;
             }
-            st.borrow_mut().wifi_done = true;
-            ui.set_page(PAGE_CHECK);
-            ui.set_status("Connected. Detecting your location…".into());
+            // The account page shows at once, with the new address. The location comes
+            // later and fills the region values that the user did not change.
+            ui.set_ip_address(ip_addresses().into());
+            goto_account(ui, &st.borrow());
             start_check(&mut st.borrow_mut(), false);
         }
         Msg::Connected(Err(e)) => {
@@ -642,7 +653,6 @@ fn main() {
     ui.set_dry_run(a.dry_run);
     ui.set_has_zsh(has_zsh());
     ui.set_ip_address(ip_addresses().into());
-    ui.set_hostname(fs::read_to_string("/etc/hostname").unwrap_or_default().trim().into());
     if !font.starts_with('/') {
         ui.set_font_family(font.into());
     }
@@ -707,7 +717,6 @@ fn main() {
         wifi_nets: vec![],
         checking: false,
         check_id: 0,
-        wifi_done: false,
         dry_run: a.dry_run,
         saved: None,
         tx,
@@ -1044,12 +1053,6 @@ mod tests {
         assert!(near(setup_progress("some line", 0.9), 0.9));
         assert!(near(setup_progress("Now starting desktop environment via sddm...", 0.6), 0.95));
         assert!(near(setup_progress("some line", 0.95), 0.95));
-    }
-
-    #[test]
-    fn step() {
-        assert_eq!(setup_step("Generating locales: it_IT.UTF-8"), Some("Setting the language…"));
-        assert_eq!(setup_step("some line"), None);
     }
 
     #[test]
